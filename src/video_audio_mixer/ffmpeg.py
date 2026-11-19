@@ -33,6 +33,27 @@ def has_audio_stream(path) -> bool:
     return bool(completed.stdout.strip())
 
 
+def measure_levels(path) -> tuple[float, float] | None:
+    """(mean, peak) level in dBFS of the first audio stream, or None when the
+    file has no audio. Uses FFmpeg's volumedetect."""
+    if not has_audio_stream(path):
+        return None
+    completed = subprocess.run(
+        [require_ffmpeg(), "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+         "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    mean = peak = None
+    for line in completed.stderr.splitlines():
+        if "mean_volume:" in line:
+            mean = float(line.split("mean_volume:")[1].split()[0])
+        elif "max_volume:" in line:
+            peak = float(line.split("max_volume:")[1].split()[0])
+    if mean is None or peak is None:
+        raise RuntimeError("Could not measure audio level of " + str(path))
+    return mean, peak
+
+
 def build_filter_complex(plan: MixPlan, *, original_audio_available: bool = True) -> str:
     use_original = plan.original_audio_enabled and original_audio_available
     inputs = []

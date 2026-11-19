@@ -2,7 +2,7 @@ from pathlib import Path
 
 from .deterministic import default_plan
 from .evaluate import EvaluationHook
-from .ffmpeg import execute_mix
+from .ffmpeg import execute_mix, measure_levels
 from .gemini import plan_with_gemini
 from .models import MixPlan
 
@@ -10,7 +10,14 @@ from .models import MixPlan
 def create_plan(context, *, use_llm: bool, model: str) -> MixPlan:
     if use_llm:
         return plan_with_gemini(context, model=model)
-    return default_plan(context.duration_seconds)
+    original = measure_levels(context.video_path)
+    music = measure_levels(context.music_path)
+    return default_plan(
+        context.duration_seconds,
+        original_mean_db=original[0] if original else None,
+        music_mean_db=music[0] if music else None,
+        music_peak_db=music[1] if music else None,
+    )
 
 
 def write_plan(plan: MixPlan, output) -> None:
