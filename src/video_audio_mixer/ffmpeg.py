@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .models import MixPlan
+from .models import MixPlan, OutputDurationPolicy
 
 
 def require_ffmpeg() -> str:
@@ -14,10 +14,30 @@ def require_ffmpeg() -> str:
     return executable
 
 
-def build_filter_complex(plan: MixPlan) -> str:
+def has_audio_stream(path) -> bool:
+    """True when the media file carries at least one audio stream.
+
+    Screen recordings, exported edits and some phone clips have no audio
+    track at all; mapping [0:a] on those makes FFmpeg fail outright.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe executable not found on PATH")
+    completed = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("ffprobe failed:\n" + completed.stderr)
+    return bool(completed.stdout.strip())
+
+
+def build_filter_complex(plan: MixPlan, *, original_audio_available: bool = True) -> str:
+    use_original = plan.original_audio_enabled and original_audio_available
     inputs = []
 
-    if plan.original_audio_enabled:
+    if use_original:
         inputs.append(f"[0:a]volume={plan.original_audio_gain_db}dB[original]")
 
     if plan.music_enabled:
@@ -41,12 +61,25 @@ def build_filter_complex(plan: MixPlan) -> str:
             )
         inputs.append("[1:a]" + ",".join(music_filters) + "[music]")
 
-    if plan.original_audio_enabled and plan.music_enabled:
-        inputs.append("[original][music]amix=inputs=2:duration=first:dropout_transition=2[aout]")
-    elif plan.original_audio_enabled:
+    if use_original and plan.music_enabled:
+        # normalize=0: amix otherwise scales every input by 1/inputs, which
+        # silently lowers the original audio (speech) by about 6 dB even when
+        # the music is muted. The plan's gains are meant to be absolute.
+        inputs.append(
+            "[original][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+        )
+    elif use_original:
         inputs.append("[original]anull[aout]")
     elif plan.music_enabled:
-        inputs.append("[music]anull[aout]")
+        # Music alone carries the soundtrack. For the "video" policy pad it
+        # with silence so a short track never cuts the picture; execute_mix
+        # then stops at the end of the video with -shortest.
+        if plan.output_duration_policy == OutputDurationPolicy.VIDEO:
+            inputs.append("[music]apad[aout]")
+        else:
+            inputs.append("[music]anull[aout]")
+    elif plan.original_audio_enabled and not original_audio_available:
+        raise ValueError("MixPlan uses only the original audio, but the video has no audio track")
     else:
         raise ValueError("MixPlan disables both audio sources")
 
@@ -57,19 +90,23 @@ def execute_mix(video, music, plan: MixPlan, output) -> Path:
     executable = require_ffmpeg()
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    original_audio_available = has_audio_stream(video)
+    music_only = plan.music_enabled and not (plan.original_audio_enabled and original_audio_available)
 
     command = [
         executable, "-y",
         "-i", str(video),
         "-i", str(music),
-        "-filter_complex", build_filter_complex(plan),
+        "-filter_complex", build_filter_complex(plan, original_audio_available=original_audio_available),
         "-map", "0:v:0",
         "-map", "[aout]",
         "-c:v", "copy",
         "-c:a", "aac",
         "-movflags", "+faststart",
     ]
-    if plan.output_duration_policy.value == "shortest":
+    if plan.output_duration_policy == OutputDurationPolicy.SHORTEST or (
+        music_only and plan.output_duration_policy == OutputDurationPolicy.VIDEO
+    ):
         command.append("-shortest")
     command.append(str(output_path))
 

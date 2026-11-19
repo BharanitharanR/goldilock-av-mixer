@@ -16,7 +16,9 @@ def add_context_args(parser):
 
 def get_context(args):
     if args.context_dir:
-        return discover_context(args.context_dir)
+        # Flags given alongside the folder pick specific files inside it.
+        return discover_context(args.context_dir, video=args.video, music=args.music,
+                                analysis=args.analysis, song_spec=args.song_spec)
     values = (args.video, args.music, args.analysis, args.song_spec)
     if not all(values):
         raise SystemExit("Supply CONTEXT_DIR or all of --video --music --analysis --song-spec")
