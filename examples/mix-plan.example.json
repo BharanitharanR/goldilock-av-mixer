@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "purpose": "Preserve natural family conversation while keeping the generated soundtrack subtle.",
+  "output_duration_policy": "video",
+  "original_audio_enabled": true,
+  "original_audio_gain_db": 0,
+  "music_enabled": true,
+  "music_gain_db": -14,
+  "music_start_seconds": 0,
+  "music_end_seconds": 87.001667,
+  "music_fade_in_seconds": 1.5,
+  "music_fade_out_seconds": 2,
+  "ducking": [
+    {
+      "start_seconds": 15.8,
+      "end_seconds": 27.2,
+      "music_gain_db": -20,
+      "reason": "Illustrative ducking during family conversation; actual plan must be grounded in input analysis."
+    }
+  ],
+  "notes": ["Illustrative plan only."]
+}
