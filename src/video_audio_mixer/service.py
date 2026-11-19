@@ -5,6 +5,7 @@ from .evaluate import EvaluationHook
 from .ffmpeg import execute_mix, measure_levels
 from .gemini import plan_with_gemini
 from .models import MixPlan
+from .speech import detect_speech
 
 
 def create_plan(context, *, use_llm: bool, model: str) -> MixPlan:
@@ -17,6 +18,7 @@ def create_plan(context, *, use_llm: bool, model: str) -> MixPlan:
         original_mean_db=original[0] if original else None,
         music_mean_db=music[0] if music else None,
         music_peak_db=music[1] if music else None,
+        speech_segments=detect_speech(context.video_path) if original else [],
     )
 
 

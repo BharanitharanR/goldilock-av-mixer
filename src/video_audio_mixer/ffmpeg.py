@@ -75,11 +75,8 @@ def build_filter_complex(plan: MixPlan, *, original_audio_available: bool = True
             music_filters.append(
                 f"afade=t=out:st={fade_start}:d={plan.music_fade_out_seconds}"
             )
-        for segment in plan.ducking:
-            relative_gain = segment.music_gain_db - plan.music_gain_db
-            music_filters.append(
-                f"volume={relative_gain}dB:enable='between(t,{segment.start_seconds},{segment.end_seconds})'"
-            )
+        if plan.ducking:
+            music_filters.append(_ducking_filter(plan))
         inputs.append("[1:a]" + ",".join(music_filters) + "[music]")
 
     if use_original and plan.music_enabled:
@@ -87,24 +84,50 @@ def build_filter_complex(plan: MixPlan, *, original_audio_available: bool = True
         # silently lowers the original audio (speech) by about 6 dB even when
         # the music is muted. The plan's gains are meant to be absolute.
         inputs.append(
-            "[original][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+            "[original][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[mixed]"
         )
     elif use_original:
-        inputs.append("[original]anull[aout]")
+        inputs.append("[original]anull[mixed]")
     elif plan.music_enabled:
         # Music alone carries the soundtrack. For the "video" policy pad it
         # with silence so a short track never cuts the picture; execute_mix
         # then stops at the end of the video with -shortest.
         if plan.output_duration_policy == OutputDurationPolicy.VIDEO:
-            inputs.append("[music]apad[aout]")
+            inputs.append("[music]apad[mixed]")
         else:
-            inputs.append("[music]anull[aout]")
+            inputs.append("[music]anull[mixed]")
     elif plan.original_audio_enabled and not original_audio_available:
         raise ValueError("MixPlan uses only the original audio, but the video has no audio track")
     else:
         raise ValueError("MixPlan disables both audio sources")
 
+    if plan.output_loudness_lufs is not None:
+        # One-pass EBU R128 normalisation: quiet phone recordings come up to a
+        # consistent level, true peaks stay under -1.5 dBTP. loudnorm works at
+        # 192 kHz internally, so resample back for the AAC encoder.
+        inputs.append(f"[mixed]loudnorm=I={plan.output_loudness_lufs}:TP=-1.5:LRA=11,aresample=48000[aout]")
+    else:
+        inputs.append("[mixed]anull[aout]")
     return ";".join(inputs)
+
+
+def _ducking_filter(plan: MixPlan) -> str:
+    """One volume filter whose gain follows every ducking segment, easing in
+    and out over ducking_ramp_seconds. At time t each segment pulls the gain
+    toward its drop by a weight that ramps 0 -> 1 -> 0 around it; where
+    segments overlap the deepest drop wins."""
+    ramp = max(plan.ducking_ramp_seconds, 0.01)
+    terms = []
+    for seg in plan.ducking:
+        drop = seg.music_gain_db - plan.music_gain_db
+        weight = (f"clip(min((t-{seg.start_seconds - ramp:.3f})/{ramp:.3f},"
+                  f"({seg.end_seconds + ramp:.3f}-t)/{ramp:.3f}),0,1)")
+        terms.append(f"{drop:.2f}*{weight}")
+    expr = terms[0]
+    for term in terms[1:]:
+        expr = f"min({expr},{term})"
+    # Commas inside the expression are escaped for the filtergraph parser.
+    return "volume=eval=frame:volume='pow(10,(" + expr.replace(",", "\\,") + ")/20)'"
 
 
 def execute_mix(video, music, plan: MixPlan, output) -> Path:

@@ -39,6 +39,11 @@ class MixPlan(BaseModel):
     music_fade_in_seconds: float = Field(default=0.0, ge=0)
     music_fade_out_seconds: float = Field(default=0.0, ge=0)
     ducking: list[DuckingSegment] = Field(default_factory=list)
+    # Music eases into and out of each ducking segment over this long, instead
+    # of jumping at its edges.
+    ducking_ramp_seconds: float = Field(default=0.25, ge=0, le=5)
+    # Integrated loudness of the finished mix (EBU R128 / LUFS); None leaves it.
+    output_loudness_lufs: float | None = Field(default=None, ge=-40, le=-5)
     notes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
