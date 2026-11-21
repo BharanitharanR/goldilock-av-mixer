@@ -40,8 +40,13 @@ def _pick(directory: Path, candidates: list[Path], kind: str, flag: str) -> Path
     )
 
 
+VOICEOVER_NAME = "voiceover.wav"
+VOICE_TIMELINE_NAME = "voiceover-timeline.json"
+
+
 def discover_context(directory: str | Path, *, video=None, music=None,
-                     analysis=None, song_spec=None) -> MixingContext:
+                     analysis=None, song_spec=None, voiceover=None,
+                     voice_timeline=None) -> MixingContext:
     """Collects the four inputs from one folder. Any of them can be named
     explicitly, which is needed when a working folder also holds derived
     copies (a browser-playable MP4 next to the original, an MP3 next to the
@@ -51,6 +56,20 @@ def discover_context(directory: str | Path, *, video=None, music=None,
         raise NotADirectoryError(directory)
 
     files = [p for p in directory.iterdir() if p.is_file()]
+
+    # Voiceover: explicit flags win; otherwise voiceover.wav and
+    # voiceover-timeline.json in the folder are picked up when present.
+    voice_path = voice_timeline_path = None
+    if voiceover:
+        voice_path = _resolve(directory, voiceover)
+    elif (directory / VOICEOVER_NAME).is_file():
+        voice_path = directory / VOICEOVER_NAME
+    if voice_timeline:
+        voice_timeline_path = _resolve(directory, voice_timeline)
+    elif voice_path is not None and (directory / VOICE_TIMELINE_NAME).is_file():
+        voice_timeline_path = directory / VOICE_TIMELINE_NAME
+    if voice_timeline_path is not None and voice_path is None:
+        raise ValueError("A voice timeline was given without a voiceover file")
     if video:
         video_path = _resolve(directory, video)
     else:
@@ -60,7 +79,9 @@ def discover_context(directory: str | Path, *, video=None, music=None,
     if music:
         music_path = _resolve(directory, music)
     else:
-        audios = [p for p in files if p.suffix.lower() in AUDIO_EXTENSIONS]
+        # The voiceover is not a music candidate.
+        audios = [p for p in files if p.suffix.lower() in AUDIO_EXTENSIONS
+                  and not (voice_path and p.resolve() == voice_path.resolve())]
         lossless = [p for p in audios if p.suffix.lower() in LOSSLESS_AUDIO_EXTENSIONS]
         # A rendered WAV plus its MP3/OGG preview is the common case: the
         # lossless file is the source, the lossy ones are copies of it.
@@ -79,11 +100,17 @@ def discover_context(directory: str | Path, *, video=None, music=None,
         music_path=str(music_path),
         analysis=_read_json(analysis_path),
         song_spec=_read_json(song_spec_path),
+        voiceover_path=str(voice_path) if voice_path else None,
+        voice_timeline_path=str(voice_timeline_path) if voice_timeline_path else None,
     )
 
 
-def load_context(video, music, analysis, song_spec) -> MixingContext:
+def load_context(video, music, analysis, song_spec, voiceover=None, voice_timeline=None) -> MixingContext:
+    if voice_timeline and not voiceover:
+        raise ValueError("A voice timeline was given without a voiceover file")
     return MixingContext(
+        voiceover_path=str(voiceover) if voiceover else None,
+        voice_timeline_path=str(voice_timeline) if voice_timeline else None,
         video_path=str(video),
         music_path=str(music),
         analysis=_read_json(Path(analysis)),

@@ -4,7 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .models import MixPlan, OutputDurationPolicy
+from .models import MixPlan, OutputDurationPolicy, UnderVoice
 
 
 def require_ffmpeg() -> str:
@@ -56,10 +56,22 @@ def measure_levels(path) -> tuple[float, float] | None:
 
 def build_filter_complex(plan: MixPlan, *, original_audio_available: bool = True) -> str:
     use_original = plan.original_audio_enabled and original_audio_available
+    use_voice = plan.voice_enabled
+    # Input order: 0 video, then music (when enabled), then voiceover (when enabled).
+    music_index = 1
+    voice_index = 2 if plan.music_enabled else 1
     inputs = []
+    carriers = []   # labels of the audio streams that go into the mix
 
     if use_original:
-        inputs.append(f"[0:a]volume={plan.original_audio_gain_db}dB[original]")
+        original_filters = [f"volume={plan.original_audio_gain_db}dB"]
+        if use_voice and plan.voice_windows:
+            drop = -60.0 if plan.original_under_voice == UnderVoice.DROP else plan.original_under_voice_db
+            original_filters.append(_dip_filter(
+                [(w.start_seconds, w.end_seconds, drop) for w in plan.voice_windows],
+                plan.ducking_ramp_seconds))
+        inputs.append("[0:a]" + ",".join(original_filters) + "[original]")
+        carriers.append("[original]")
 
     if plan.music_enabled:
         music_filters = [f"volume={plan.music_gain_db}dB"]
@@ -77,29 +89,40 @@ def build_filter_complex(plan: MixPlan, *, original_audio_available: bool = True
             )
         if plan.ducking:
             music_filters.append(_ducking_filter(plan))
-        inputs.append("[1:a]" + ",".join(music_filters) + "[music]")
+        inputs.append(f"[{music_index}:a]" + ",".join(music_filters) + "[music]")
+        carriers.append("[music]")
 
-    if use_original and plan.music_enabled:
+    if use_voice:
+        # Upmix to stereo so a mono voiceover sits in the centre of the mix.
+        inputs.append(f"[{voice_index}:a]volume={plan.voice_gain_db}dB,"
+                      "aformat=channel_layouts=stereo[voice]")
+        carriers.append("[voice]")
+
+    if not carriers:
+        if plan.original_audio_enabled and not original_audio_available:
+            raise ValueError("MixPlan uses only the original audio, but the video has no audio track")
+        raise ValueError("MixPlan disables both audio sources")
+
+    if len(carriers) == 1:
+        label = carriers[0]
+        if not use_original and plan.output_duration_policy == OutputDurationPolicy.VIDEO:
+            # Pad so a short track never cuts the picture; execute_mix then
+            # stops at the end of the video with -shortest.
+            inputs.append(f"{label}apad[mixed]")
+        else:
+            inputs.append(f"{label}anull[mixed]")
+    else:
         # normalize=0: amix otherwise scales every input by 1/inputs, which
         # silently lowers the original audio (speech) by about 6 dB even when
         # the music is muted. The plan's gains are meant to be absolute.
-        inputs.append(
-            "[original][music]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[mixed]"
-        )
-    elif use_original:
-        inputs.append("[original]anull[mixed]")
-    elif plan.music_enabled:
-        # Music alone carries the soundtrack. For the "video" policy pad it
-        # with silence so a short track never cuts the picture; execute_mix
-        # then stops at the end of the video with -shortest.
-        if plan.output_duration_policy == OutputDurationPolicy.VIDEO:
-            inputs.append("[music]apad[mixed]")
-        else:
-            inputs.append("[music]anull[mixed]")
-    elif plan.original_audio_enabled and not original_audio_available:
-        raise ValueError("MixPlan uses only the original audio, but the video has no audio track")
-    else:
-        raise ValueError("MixPlan disables both audio sources")
+        # With the original present it sets the length; without it the longest
+        # track does, and the video policy pads and trims to the picture.
+        duration = "first" if use_original else "longest"
+        mixer = (f"{''.join(carriers)}amix=inputs={len(carriers)}:duration={duration}:"
+                 "dropout_transition=2:normalize=0")
+        if not use_original and plan.output_duration_policy == OutputDurationPolicy.VIDEO:
+            mixer += ",apad"
+        inputs.append(mixer + "[mixed]")
 
     if plan.output_loudness_lufs is not None:
         # One-pass EBU R128 normalisation: quiet phone recordings come up to a
@@ -111,36 +134,51 @@ def build_filter_complex(plan: MixPlan, *, original_audio_available: bool = True
     return ";".join(inputs)
 
 
-def _ducking_filter(plan: MixPlan) -> str:
-    """One volume filter whose gain follows every ducking segment, easing in
-    and out over ducking_ramp_seconds. At time t each segment pulls the gain
-    toward its drop by a weight that ramps 0 -> 1 -> 0 around it; where
-    segments overlap the deepest drop wins."""
-    ramp = max(plan.ducking_ramp_seconds, 0.01)
+def _dip_expr(dips, ramp_seconds: float) -> str:
+    """Gain change in dB over time. At time t each (start, end, drop_db) pulls
+    the gain toward its drop by a weight that ramps 0 -> 1 -> 0 around it;
+    where dips overlap the deepest drop wins."""
+    ramp = max(ramp_seconds, 0.01)
     terms = []
-    for seg in plan.ducking:
-        drop = seg.music_gain_db - plan.music_gain_db
-        weight = (f"clip(min((t-{seg.start_seconds - ramp:.3f})/{ramp:.3f},"
-                  f"({seg.end_seconds + ramp:.3f}-t)/{ramp:.3f}),0,1)")
+    for start, end, drop in dips:
+        weight = (f"clip(min((t-{start - ramp:.3f})/{ramp:.3f},"
+                  f"({end + ramp:.3f}-t)/{ramp:.3f}),0,1)")
         terms.append(f"{drop:.2f}*{weight}")
     expr = terms[0]
     for term in terms[1:]:
         expr = f"min({expr},{term})"
+    return expr
+
+
+def _dip_filter(dips, ramp_seconds: float) -> str:
     # Commas inside the expression are escaped for the filtergraph parser.
+    expr = _dip_expr(dips, ramp_seconds)
     return "volume=eval=frame:volume='pow(10,(" + expr.replace(",", "\\,") + ")/20)'"
 
 
-def execute_mix(video, music, plan: MixPlan, output) -> Path:
+def _ducking_filter(plan: MixPlan) -> str:
+    """One volume filter whose gain follows every ducking segment, easing in
+    and out over ducking_ramp_seconds."""
+    return _dip_filter([(seg.start_seconds, seg.end_seconds, seg.music_gain_db - plan.music_gain_db)
+                        for seg in plan.ducking], plan.ducking_ramp_seconds)
+
+
+def execute_mix(video, music, plan: MixPlan, output, voiceover=None) -> Path:
     executable = require_ffmpeg()
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if plan.voice_enabled and voiceover is None:
+        raise ValueError("MixPlan has voice_enabled but no voiceover file was given")
     original_audio_available = has_audio_stream(video)
-    music_only = plan.music_enabled and not (plan.original_audio_enabled and original_audio_available)
+    # Without the video's own sound, the music and/or voice carry the track.
+    carried_by_added_audio = not (plan.original_audio_enabled and original_audio_available)
 
-    command = [
-        executable, "-y",
-        "-i", str(video),
-        "-i", str(music),
+    command = [executable, "-y", "-i", str(video)]
+    if plan.music_enabled:
+        command += ["-i", str(music)]
+    if plan.voice_enabled:
+        command += ["-i", str(voiceover)]
+    command += [
         "-filter_complex", build_filter_complex(plan, original_audio_available=original_audio_available),
         "-map", "0:v:0",
         "-map", "[aout]",
@@ -149,7 +187,7 @@ def execute_mix(video, music, plan: MixPlan, output) -> Path:
         "-movflags", "+faststart",
     ]
     if plan.output_duration_policy == OutputDurationPolicy.SHORTEST or (
-        music_only and plan.output_duration_policy == OutputDurationPolicy.VIDEO
+        carried_by_added_audio and plan.output_duration_policy == OutputDurationPolicy.VIDEO
     ):
         command.append("-shortest")
     command.append(str(output_path))

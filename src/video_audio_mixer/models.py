@@ -26,6 +26,22 @@ class DuckingSegment(BaseModel):
         return self
 
 
+class UnderVoice(str, Enum):
+    KEEP = "keep"   # original audio stays, lowered under the voiceover
+    DROP = "drop"   # original audio is muted inside voice windows, kept elsewhere
+
+
+class VoiceWindow(BaseModel):
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def valid_interval(self):
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds")
+        return self
+
+
 class MixPlan(BaseModel):
     schema_version: str = "1.0"
     purpose: str
@@ -38,6 +54,13 @@ class MixPlan(BaseModel):
     music_end_seconds: float | None = Field(default=None, ge=0)
     music_fade_in_seconds: float = Field(default=0.0, ge=0)
     music_fade_out_seconds: float = Field(default=0.0, ge=0)
+    # Optional voiceover track (third ffmpeg input). Windows are the padded,
+    # merged times where the voice speaks; the original audio dips there.
+    voice_enabled: bool = False
+    voice_gain_db: float = Field(default=0.0, ge=-60, le=24)
+    voice_windows: list[VoiceWindow] = Field(default_factory=list)
+    original_under_voice: UnderVoice = UnderVoice.KEEP
+    original_under_voice_db: float = Field(default=-12.0, ge=-60, le=0)
     ducking: list[DuckingSegment] = Field(default_factory=list)
     # Music eases into and out of each ducking segment over this long, instead
     # of jumping at its edges.
@@ -65,6 +88,8 @@ class MixingContext(BaseModel):
     music_path: str
     analysis: dict[str, Any]
     song_spec: dict[str, Any]
+    voiceover_path: str | None = None
+    voice_timeline_path: str | None = None
 
     @property
     def duration_seconds(self) -> float | None:
